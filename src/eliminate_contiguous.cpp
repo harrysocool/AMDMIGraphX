@@ -122,8 +122,10 @@ static void remove_contiguous(const std::string& op_name, module& m, F f)
 
     for(auto ins : iterator_for(m))
     {
-        // return instruction should have inputs with standard shape
-        if(ins->name() == "@return")
+        // return and hip::copy_from_gpu instructions require standard-shaped inputs:
+        // @return because the program result must be addressable by callers,
+        // copy_from_gpu because the CPU consumer receives the strides as-is.
+        if(contains({"@return", "hip::copy_from_gpu"}, ins->name()))
             continue;
 
         if(ins != last and ins->outputs().empty())

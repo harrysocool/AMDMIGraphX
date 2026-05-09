@@ -33,10 +33,18 @@ namespace device {
 static void contiguous_nonstandard(hipStream_t stream, const argument& result, const argument& arg)
 {
     shape s{result.get_shape().type(), result.get_shape().lens()};
+    // Use flat gs_launch + shape.multi() instead of mi_gs_launch to avoid
+    // product-order multi-index iteration, which can crash for NHWC tensors
+    // where stride[channel]==1 (channel-last in a logical NCHW shape).
+    // The flat approach uses the same guard as gs_launch (i < n) and is
+    // functionally identical but avoids the mi_gs_launch edge case.
+    index_int nelements = result.get_shape().elements();
     visit_all(result, arg)([&](auto output_v, auto input_v) {
         hip_visit_views(output_v, input_v, s)([&](auto output, auto input, auto standard_shape) {
-            mi_gs_launch(stream,
-                         standard_shape)([=](auto idx) __device__ { output[idx] = input[idx]; });
+            gs_launch(stream, nelements)([=](auto i) __device__ {
+                auto idx = standard_shape.multi(i);
+                output[idx] = input[idx];
+            });
         });
     });
 }
