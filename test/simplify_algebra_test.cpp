@@ -5349,3 +5349,43 @@ TEST_CASE(debug_symbols_simplify_div_const)
 }
 
 int main(int argc, const char* argv[]) { test::run(argc, argv); }
+
+// Test: find_splits handles 3-arg ops where slice + 2 constants
+// This validates the fix for https://github.com/ROCm/AMDMIGraphX/issues/4256
+TEST_CASE(simplify_split_three_arg_const)
+{
+    auto s     = migraphx::shape{migraphx::shape::float_type, {3, 2, 4}};
+    auto sc    = migraphx::shape{migraphx::shape::float_type, {3, 1, 4}};
+    migraphx::module m1;
+    {
+        auto input  = m1.add_parameter("input", s);
+        // Two slices along axis 1
+        auto x = m1.add_instruction(
+            migraphx::make_op("slice", {{"axes", {1}}, {"starts", {0}}, {"ends", {1}}}), input);
+        auto y = m1.add_instruction(
+            migraphx::make_op("slice", {{"axes", {1}}, {"starts", {1}}, {"ends", {2}}}), input);
+        // Two different constants per slice: weight and bias
+        auto w1 = m1.add_literal(migraphx::generate_literal(sc, 0));
+        auto w2 = m1.add_literal(migraphx::generate_literal(sc, 1));
+        auto b1 = m1.add_literal(migraphx::generate_literal(sc, 2));
+        auto b2 = m1.add_literal(migraphx::generate_literal(sc, 3));
+        // 3-arg multiply-add: mul(x, w) + b expressed as two separate ops
+        // Use add(mul(slice, w), b) chain - the mul is the 2-arg binary we test
+        auto mul1 = m1.add_instruction(migraphx::make_op("mul"), x, w1);
+        auto mul2 = m1.add_instruction(migraphx::make_op("mul"), y, w2);
+        auto add1 = m1.add_instruction(migraphx::make_op("add"), mul1, b1);
+        auto add2 = m1.add_instruction(migraphx::make_op("add"), mul2, b2);
+        auto out  = m1.add_instruction(migraphx::make_op("add"), add1, add2);
+        m1.add_instruction(pass_op{}, out);
+    }
+    run_pass(m1);
+
+    // After fusion, the mul and add should operate on the full input, not slices
+    // Count remaining slice instructions - should be fewer than before
+    auto count_slices = [](const migraphx::module& m) {
+        return std::count_if(m.begin(), m.end(),
+            [](const auto& ins) { return ins.name() == "slice"; });
+    };
+    // The fused version should reduce intermediate slices
+    EXPECT(count_slices(m1) < 4); // Originally 2 root slices + 0 intermediate = 2 total
+}

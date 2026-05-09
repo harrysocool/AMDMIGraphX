@@ -1396,8 +1396,14 @@ struct find_splits
             {
                 c = m.insert_instruction(std::next(ins), op, {ins}, start->module_inputs());
             }
-            else if(start->inputs().size() == 2)
+            else if(start->inputs().size() >= 2)
             {
+                // Handles binary ops (size==2) and multi-arg ops (size>2) where
+                // exactly one argument comes from a split and all others are constants.
+                // This enables horizontal fusion across window-attention splits where
+                // each window op has the form: op(slice_i, weight_0, weight_1, ..., weight_k)
+                // Fix for: https://github.com/ROCm/AMDMIGraphX/issues/4256
+
                 assert(not std::none_of(start->inputs().begin(), start->inputs().end(), [](auto i) {
                     return i->name() == "slice";
                 }) and "one argument must be a split");
@@ -1410,47 +1416,47 @@ struct find_splits
                 if(not concat_const_foldable(group.begin(), group.end(), concat_axis))
                     return;
 
+                // Find the split argument index (the one that comes from a slice)
                 split_idx = get_binary_op_split_idx(group, splits);
-                assert(split_idx < 2);
-                size_t data_idx;
                 if(split_idx < 0 and op.attributes().contains("commutative"))
                 {
                     split_idx = 0;
-                    data_idx  = 1;
                     align_commutative_op_args(m, group, splits, split_idx);
                 }
                 else if(split_idx < 0)
                 {
                     return;
                 }
-                else
+
+                // Build new args: split_idx position gets the root tensor,
+                // all other positions get a concat of the constant args across the group
+                std::vector<instruction_ref> new_args(start->inputs().size());
+                new_args[split_idx] = ins;
+
+                for(std::size_t arg_i = 0; arg_i < start->inputs().size(); ++arg_i)
                 {
-                    data_idx = split_idx == 0 ? 1 : 0;
+                    if(static_cast<int>(arg_i) == split_idx)
+                        continue;
+
+                    // Collect this argument from each instruction in the group
+                    std::vector<instruction_ref> const_args;
+                    std::transform(group.begin(),
+                                   group.end(),
+                                   std::back_inserter(const_args),
+                                   [&](auto g_ins) { return g_ins->inputs()[arg_i]; });
+
+                    // All non-split arguments must be evaluable constants
+                    if(std::any_of(const_args.begin(), const_args.end(), [](auto i) {
+                           return not i->can_eval();
+                       }))
+                        return;
+
+                    move_instructions_back(m, ins, const_args);
+                    new_args[arg_i] = m.insert_instruction(
+                        ins, make_op("concat", {{"axis", concat_axis}}), const_args);
                 }
 
-                std::vector<instruction_ref> data_args;
-                std::transform(group.begin(),
-                               group.end(),
-                               std::back_inserter(data_args),
-                               [&](auto i) { return i->inputs()[data_idx]; });
-
-                // Data arguments must be a constant
-                if(std::any_of(data_args.begin(), data_args.end(), [](auto i) {
-                       return not i->can_eval();
-                   }))
-                    return;
-
-                move_instructions_back(m, ins, data_args);
-
-                // TODO: Check if axises match
-                auto concat = m.insert_instruction(
-                    ins, make_op("concat", {{"axis", concat_axis}}), data_args);
-
-                std::vector<instruction_ref> args;
-                args.resize(2);
-                args[split_idx] = ins;
-                args[data_idx]  = concat;
-                c = m.insert_instruction(std::next(ins), op, {args}, start->module_inputs());
+                c = m.insert_instruction(std::next(ins), op, new_args, start->module_inputs());
             }
             if(c != m.end())
             {
