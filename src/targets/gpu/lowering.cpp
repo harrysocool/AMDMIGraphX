@@ -149,20 +149,38 @@ struct miopen_apply
             // output with copy output
             for(const auto& in : inputs)
             {
-                // TODO: Ensure output is in standard (C-contiguous) layout before copying
-                // to host.  MIGraphX may use non-standard layouts (e.g. NHWC) internally,
-                // producing non-standard strides at the offload_copy CPU boundary.
-                // Without normalization, callers must transpose ~89ms on the CPU (27 MB
-                // at 1008px); the GPU can do the same in < 1 ms.
+                // TODO: Insert contiguous before copy_from_gpu to normalise NHWC->NCHW.
+                // MIGraphX uses non-standard layouts (e.g. NHWC) for GPU efficiency,
+                // so offload_copy outputs arrive with non-standard strides at the CPU
+                // boundary.  Without this, callers must do an ~89ms CPU transpose
+                // (27 MB at 1008px); the GPU can do the same in < 1 ms.
                 //
-                // Intended fix (blocked by gpu::contiguous runtime bug for channel-last
-                // strides where stride[channel] == 1 — see companion issue):
-                //
+                // Investigation (branch fix/offload-copy-contiguous-output):
+                // The intended code:
                 //   auto copy_src = in;
                 //   if(not in->get_shape().standard())
                 //       copy_src = mod->insert_instruction(ret, make_op("contiguous"), in);
                 //   auto p_output = mod->insert_instruction(
                 //       ret, make_op("hip::copy_from_gpu"), copy_src);
+                //
+                // Is blocked by three compounding issues:
+                //   1. eliminate_contiguous removes gpu::contiguous before copy_from_gpu
+                //      because copy_from_gpu accepts non-standard input shapes.
+                //      Fix: add "hip::copy_from_gpu" to the skip-list in
+                //      eliminate_contiguous.cpp (alongside "@return").
+                //   2. Even with (1), fuse_ops does not fuse gpu::contiguous with a
+                //      preceding gpu::code_object[layout_kernel] because fuse_ops only
+                //      recognises precompile_name("layout") and "pointwise" types.
+                //      Without fusion, the raw contiguous_nonstandard device kernel runs.
+                //   3. contiguous_nonstandard crashes for the backbone stride pattern
+                //      {5308416, 1, 36864, 256} (NHWC channel-last within NCHW shape).
+                //      The crash is HIP_ERROR_ILLEGAL_ADDRESS in allocate_gpu() on the
+                //      next allocation.  All array bounds are mathematically correct;
+                //      root cause is a suspected stream-sync or kernel launch edge case.
+                //
+                // Forward paths: fix contiguous_nonstandard; or add a post-fuse-ops
+                // pass that inserts gpu::contiguous directly; or teach fuse_ops to
+                // recognise gpu::code_object[layout_kernel] as a fuseable predecessor.
                 auto p_output = mod->insert_instruction(ret, make_op("hip::copy_from_gpu"), in);
                 instruction::replace_argument(ret, in, p_output);
             }
