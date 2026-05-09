@@ -149,6 +149,20 @@ struct miopen_apply
             // output with copy output
             for(const auto& in : inputs)
             {
+                // TODO: Ensure output is in standard (C-contiguous) layout before copying
+                // to host.  MIGraphX may use non-standard layouts (e.g. NHWC) internally,
+                // producing non-standard strides at the offload_copy CPU boundary.
+                // Without normalization, callers must transpose ~89ms on the CPU (27 MB
+                // at 1008px); the GPU can do the same in < 1 ms.
+                //
+                // Intended fix (blocked by gpu::contiguous runtime bug for channel-last
+                // strides where stride[channel] == 1 — see companion issue):
+                //
+                //   auto copy_src = in;
+                //   if(not in->get_shape().standard())
+                //       copy_src = mod->insert_instruction(ret, make_op("contiguous"), in);
+                //   auto p_output = mod->insert_instruction(
+                //       ret, make_op("hip::copy_from_gpu"), copy_src);
                 auto p_output = mod->insert_instruction(ret, make_op("hip::copy_from_gpu"), in);
                 instruction::replace_argument(ret, in, p_output);
             }
