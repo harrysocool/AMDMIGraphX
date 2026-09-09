@@ -63,6 +63,7 @@
 # Build directories (root only)
 /build*
 /cmake-build*
+/dist/
 
 # Recommended location to install rbuild dependencies from README.md
 /depend*

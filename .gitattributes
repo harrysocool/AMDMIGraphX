@@ -1,0 +1,3 @@
+# Unified-diff context lines legitimately contain a single prefix space.
+tools/sam3_fc1sink/align_sink_final.patch -whitespace
+tools/sam3_fc1sink/licenses/* -whitespace

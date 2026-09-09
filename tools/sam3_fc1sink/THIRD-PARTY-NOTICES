@@ -1,0 +1,48 @@
+# Third-party notices
+
+This file describes source incorporated into, statically linked into, or used
+as template code by the SAM3 FC1-sink MIGraphX binary prefix. The corresponding
+license texts are included in the adjacent `licenses/` directory.
+
+| Project | Pinned version | Use in the binary prefix | License file |
+|---|---|---|---|
+| rocMLIR and its LLVM project | `f3404d59b581fdf9d8cd7c1be9aeeb267851af93`, based on `c35e77b199d2492e8e0f92b3f5ed762700d9334a` | `librockCompiler.a` and LLVM compiler runtime code are statically linked into the MIGraphX GPU library | `rocmlir-LLVM-LICENSE` |
+| Composable Kernel | `ad0db05b040bacda751c65c705261b8a0a7ed25d` | Static host library and template-generated GPU kernels | `composable-kernel-LICENSE` |
+| Abseil | `20250512.0` | Static libraries used by protobuf | `abseil-LICENSE` |
+| Protocol Buffers | `v30.0` | Static serialization libraries | `protobuf-LICENSE` |
+| utf8_range | vendored by Protocol Buffers `v30.0` | Static UTF-8 validation library used by protobuf | `utf8_range-LICENSE` |
+| ONNX schema | `ef516e7ba963c4e604cfa24d64a2178e02817a53` | Vendored schema and generated protobuf code compiled into `libmigraphx_onnx` | `onnx-LICENSE` |
+| TensorFlow schema | `v1.12.0` (`a6d8ffae097d0132989ae4688d224121ec6d8f35`) | Vendored schemas and generated protobuf code compiled into `libmigraphx_tf` | `tensorflow-LICENSE` |
+| nlohmann/json | `v3.8.0` | Header-only JSON implementation compiled into MIGraphX | `nlohmann-json-LICENSE` |
+| pybind11 | `3e9dfa2866941655c56877882565e7577de6fc7b` | Header-only Python binding implementation | `pybind11-LICENSE` |
+| msgpack-c | `cpp-3.3.0` | Serialization implementation compiled into MIGraphX | `msgpack-c-LICENSE` |
+| SQLite | `3.50.4` | Static library linked into MIGraphX | `sqlite-LICENSE` |
+| Eigen | `5.0.1` | Header-only implementation used by reference operations | `eigen-LICENSE` |
+
+MIGraphX itself is distributed under the MIT License, included separately as
+`share/doc/amdrocm-migraphx/LICENSE` in the archive.
+
+ROCm runtime libraries, MIOpen, rocBLAS, hipBLASLt, Python, and the C/C++
+runtime are dynamically supplied by the target system or container and are not
+copied into this archive. ONNX Runtime, PyTorch, SAM3 checkpoints, and compiled
+SAM3 model artifacts are also distributed separately.
+
+Upstream source locations:
+
+- <https://github.com/ROCm/rocMLIR>
+- <https://github.com/llvm/llvm-project>
+- <https://github.com/ROCm/composable_kernel>
+- <https://github.com/abseil/abseil-cpp>
+- <https://github.com/protocolbuffers/protobuf>
+- <https://github.com/protocolbuffers/utf8_range>
+- <https://github.com/onnx/onnx/tree/ef516e7ba963c4e604cfa24d64a2178e02817a53>
+- <https://github.com/tensorflow/tensorflow/tree/a6d8ffae097d0132989ae4688d224121ec6d8f35>
+- <https://github.com/nlohmann/json>
+- <https://github.com/pybind/pybind11>
+- <https://github.com/msgpack/msgpack-c>
+- <https://github.com/sqlite/sqlite>
+- <https://gitlab.com/libeigen/eigen>
+
+The vendored ONNX schema matches the pinned upstream source except for its
+`onnx_for_migraphx` package namespace. The TensorFlow v1.12.0 schema files
+match after shortening their local import paths.
