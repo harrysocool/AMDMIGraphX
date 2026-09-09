@@ -2,7 +2,8 @@
 
 This file describes source incorporated into, statically linked into, or used
 as template code by the SAM3 FC1-sink MIGraphX binary prefix. The corresponding
-license texts are included in the adjacent `licenses/` directory.
+license and notice files are included in the adjacent `licenses/` directory in
+the source tree and under `share/doc/third-party/` in the packaged prefix.
 
 | Project | Pinned version | Use in the binary prefix | License file |
 |---|---|---|---|
@@ -15,9 +16,9 @@ license texts are included in the adjacent `licenses/` directory.
 | TensorFlow schema | `v1.12.0` (`a6d8ffae097d0132989ae4688d224121ec6d8f35`) | Vendored schemas and generated protobuf code compiled into `libmigraphx_tf` | `tensorflow-LICENSE` |
 | nlohmann/json | `v3.8.0` | Header-only JSON implementation compiled into MIGraphX | `nlohmann-json-LICENSE` |
 | pybind11 | `3e9dfa2866941655c56877882565e7577de6fc7b` | Header-only Python binding implementation | `pybind11-LICENSE` |
-| msgpack-c | `cpp-3.3.0` | Serialization implementation compiled into MIGraphX | `msgpack-c-LICENSE` |
+| msgpack-c | `cpp-3.3.0` (`6e7deb809120881634b3ca895e66b2a946084f34`) | Serialization implementation compiled into MIGraphX | `msgpack-c-LICENSE`, `msgpack-c-COPYING`, `msgpack-c-NOTICE` |
 | SQLite | `3.50.4` | Static library linked into MIGraphX | `sqlite-LICENSE` |
-| Eigen | `5.0.1` | Header-only implementation used by reference operations | `eigen-LICENSE` |
+| Eigen | `5.0.1` (`bc3b39870ecb690a623a3f49149a358b95c5781d`) | Header-only implementation used by reference operations | `eigen-LICENSE`, `eigen-README.md` |
 
 MIGraphX itself is distributed under the MIT License, included separately as
 `share/doc/amdrocm-migraphx/LICENSE` in the archive.
@@ -39,9 +40,9 @@ Upstream source locations:
 - <https://github.com/tensorflow/tensorflow/tree/a6d8ffae097d0132989ae4688d224121ec6d8f35>
 - <https://github.com/nlohmann/json>
 - <https://github.com/pybind/pybind11>
-- <https://github.com/msgpack/msgpack-c>
+- <https://github.com/msgpack/msgpack-c/tree/6e7deb809120881634b3ca895e66b2a946084f34>
 - <https://github.com/sqlite/sqlite>
-- <https://gitlab.com/libeigen/eigen>
+- <https://gitlab.com/libeigen/eigen/-/tree/bc3b39870ecb690a623a3f49149a358b95c5781d>
 
 The vendored ONNX schema matches the pinned upstream source except for its
 `onnx_for_migraphx` package namespace. The TensorFlow v1.12.0 schema files
