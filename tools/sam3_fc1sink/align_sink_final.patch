@@ -1,0 +1,279 @@
+diff --git a/mlir/lib/Dialect/Rock/Transforms/AlignTiling.cpp b/mlir/lib/Dialect/Rock/Transforms/AlignTiling.cpp
+index 30e7476aabcb92aaa8a48c92caa707a8e02328c0..420145dbff88b76cc1bf5d632d64c0bb90a59dca 100644
+--- a/mlir/lib/Dialect/Rock/Transforms/AlignTiling.cpp
++++ b/mlir/lib/Dialect/Rock/Transforms/AlignTiling.cpp
+@@ -39,6 +39,7 @@
+ #include "mlir/Dialect/Vector/IR/VectorOps.h"
+ #include "mlir/IR/BuiltinTypes.h"
+ #include "mlir/IR/Dominance.h"
++#include "mlir/IR/IRMapping.h"
+ #include "mlir/IR/Matchers.h"
+ #include "mlir/IR/PatternMatch.h"
+ #include "mlir/IR/TypeUtilities.h"
+@@ -61,6 +62,7 @@
+ #include "llvm/Support/ScopedPrinter.h"
+ #include "llvm/Support/raw_ostream.h"
+ 
++#include <cstdlib>
+ #include <deque>
+ #include <numeric>
+ 
+@@ -1650,6 +1652,250 @@ ReduceRewritePattern::matchAndRewrite(rock::ReduceOp reduceOp,
+   return success();
+ }
+ 
++/// Experimental lowering for the final exact-GELU output fusion.  At this
++/// point all normal align rewrites (including the final memref.copy rewrite)
++/// have completed, so the ThreadwiseWriteAll destination is the real kernel
++/// output.  Compute each scalar immediately before its existing scalar global
++/// store and reuse a dead input tile for the value.  This removes the full
++/// private result tile while preserving each element's FP16 operation order.
++static LogicalResult sinkFinalErfGeneric(func::FuncOp func) {
++  const char *enable = std::getenv("ROCMLIR_SINK_FINAL_ERF");
++  if (!enable || StringRef(enable) != "1")
++    return success();
++  if (func.getName() != "mlir_dot_add_mul_erf_add_mul")
++    return success();
++
++  SmallVector<linalg::GenericOp> candidates;
++  func.walk([&](linalg::GenericOp generic) {
++    bool hasErf = false;
++    generic.getRegion().walk([&](math::ErfOp) { hasErf = true; });
++    if (hasErf)
++      candidates.push_back(generic);
++  });
++
++  IRRewriter b(func.getContext());
++  for (linalg::GenericOp generic : candidates) {
++    if (!generic.getRegion().hasOneBlock() || generic.getInputs().size() != 2 ||
++        generic.getOutputs().size() != 1)
++      continue;
++    if (!llvm::all_of(generic.getIteratorTypesArray(),
++                      [](utils::IteratorType type) {
++                        return linalg::isParallelIterator(type);
++                      }))
++      continue;
++    if (!llvm::all_of(generic.getIndexingMapsArray(),
++                      [](AffineMap map) { return map.isIdentity(); }))
++      continue;
++
++    Block &body = generic.getRegion().front();
++    const size_t numInputs = generic.getInputs().size();
++    if (body.getNumArguments() != numInputs + 1 ||
++        !body.getArgument(numInputs).use_empty())
++      continue;
++    auto yield = dyn_cast<linalg::YieldOp>(body.getTerminator());
++    if (!yield || yield.getValues().size() != 1)
++      continue;
++    SmallVector<Operation *, 5> payload;
++    for (Operation &bodyOp : body.without_terminator())
++      payload.push_back(&bodyOp);
++    if (payload.size() != 5 || !isa<arith::AddFOp>(payload[0]) ||
++        !isa<arith::MulFOp>(payload[1]) || !isa<math::ErfOp>(payload[2]) ||
++        !isa<arith::AddFOp>(payload[3]) || !isa<arith::MulFOp>(payload[4]) ||
++        yield.getValues().front() != payload.back()->getResult(0))
++      continue;
++    auto firstAdd = cast<arith::AddFOp>(payload[0]);
++    auto firstMul = cast<arith::MulFOp>(payload[1]);
++    auto erf = cast<math::ErfOp>(payload[2]);
++    auto secondAdd = cast<arith::AddFOp>(payload[3]);
++    auto finalMul = cast<arith::MulFOp>(payload[4]);
++    if (!llvm::is_contained(firstAdd.getOperands(), body.getArgument(0)) ||
++        !llvm::is_contained(firstAdd.getOperands(), body.getArgument(1)) ||
++        !llvm::is_contained(firstMul.getOperands(), firstAdd.getResult()) ||
++        erf.getOperand() != firstMul.getResult() ||
++        !llvm::is_contained(secondAdd.getOperands(), erf.getResult()) ||
++        !llvm::is_contained(finalMul.getOperands(), firstAdd.getResult()) ||
++        !llvm::is_contained(finalMul.getOperands(), secondAdd.getResult()))
++      continue;
++
++    Value resultTile = generic.getOutputs().front();
++    auto resultType = dyn_cast<MemRefType>(resultTile.getType());
++    auto resultAlloc = resultTile.getDefiningOp<GpuAllocOp>();
++    if (!resultType || resultType.getRank() != 1 ||
++        resultType.getNumElements() != 128 ||
++        !resultType.getElementType().isF16() || !resultAlloc)
++      continue;
++    auto resultMemorySpace =
++        dyn_cast_or_null<gpu::AddressSpaceAttr>(resultType.getMemorySpace());
++    if (!resultMemorySpace ||
++        resultMemorySpace.getValue() != gpu::AddressSpace::Private)
++      continue;
++
++    bool badInput = generic.getInputs()[0] == generic.getInputs()[1];
++    for (auto [index, input] : llvm::enumerate(generic.getInputs())) {
++      auto inputType = dyn_cast<MemRefType>(input.getType());
++      BlockArgument argument = body.getArgument(index);
++      if (!inputType || inputType.getRank() != 1 ||
++          inputType.getShape() != resultType.getShape() ||
++          inputType.getElementType() != argument.getType() ||
++          !input.getDefiningOp<GpuAllocOp>() || input == resultTile ||
++          llvm::any_of(input.getUsers(), [](Operation *user) {
++            return isa<TransformOp>(user);
++          })) {
++        badInput = true;
++        break;
++      }
++    }
++    if (badInput)
++      continue;
++
++    ThreadwiseWriteAllOp writer;
++    bool badResultUse = false;
++    for (Operation *user : resultTile.getUsers()) {
++      if (user == generic.getOperation())
++        continue;
++      auto candidateWriter = dyn_cast<ThreadwiseWriteAllOp>(user);
++      if (!candidateWriter || candidateWriter.getSource() != resultTile ||
++          writer) {
++        badResultUse = true;
++        break;
++      }
++      writer = candidateWriter;
++    }
++    if (badResultUse || !writer || writer.getStoreMethod() != StoreMethod::Set)
++      continue;
++    if (generic->getBlock() != writer->getBlock() ||
++        !generic->isBeforeInBlock(writer.getOperation()) ||
++        !writer.getForceUnroll())
++      continue;
++
++    Value reuseTile;
++    for (Value input : generic.getInputs()) {
++      if (input.getType() != resultTile.getType() ||
++          !input.getDefiningOp<GpuAllocOp>())
++        continue;
++      bool deadAtGeneric = llvm::all_of(input.getUsers(), [&](Operation *user) {
++        if (user == generic.getOperation())
++          return true;
++        Operation *topLevel = user;
++        Operation *parent = generic->getParentOp();
++        while (topLevel && topLevel->getParentOp() != parent)
++          topLevel = topLevel->getParentOp();
++        return topLevel && topLevel->getBlock() == generic->getBlock() &&
++               topLevel->isBeforeInBlock(generic.getOperation());
++      });
++      if (deadAtGeneric) {
++        reuseTile = input;
++        break;
++      }
++    }
++    if (!reuseTile)
++      continue;
++
++    b.setInsertionPoint(writer);
++    Location loc = writer.getLoc();
++    Value destView = transform(b, writer.getDest(), writer.getExtraViews());
++    destView = isolateTransforms(b, destView);
++    auto destViewType = dyn_cast<MemRefType>(destView.getType());
++    if (!destViewType)
++      continue;
++    const size_t extraIdxCount = writer.getExtraIndices().size();
++    if (destViewType.getRank() <= static_cast<int64_t>(extraIdxCount))
++      continue;
++    const int64_t iterLen = destViewType.getShape()[extraIdxCount];
++    if (iterLen != resultType.getNumElements())
++      continue;
++    if (isa<VectorType>(destViewType.getElementType()) ||
++        getMaxVectorization(destView, extraIdxCount).max != 1)
++      continue;
++
++    collapseContiguousMerges(destView);
++    auto [destBuffer, transforms, needs64BitIdx] = untransform(b, destView);
++    auto destBufferType = dyn_cast<MemRefType>(destBuffer.getType());
++    if (!destBufferType ||
++        destBufferType.getElementType() != yield.getValues().front().getType())
++      continue;
++    if (auto memorySpace = dyn_cast_or_null<gpu::AddressSpaceAttr>(
++            destBufferType.getMemorySpace());
++        memorySpace && memorySpace.getValue() != gpu::AddressSpace::Global)
++      continue;
++    auto destArgument = dyn_cast<BlockArgument>(destBuffer);
++    if (!destArgument || destArgument.getOwner() != &func.getBody().front())
++      continue;
++
++    constexpr int64_t chunkSize = 1;
++    constexpr bool sinkForceUnroll = true;
++
++    Value zero = b.createOrFold<arith::ConstantIndexOp>(loc, 0);
++    SmallVector<Value, 5> starts = llvm::to_vector<5>(writer.getExtraIndices());
++    starts.push_back(zero);
++    SmallVector<int64_t, 5> bounds(starts.size() - 1, 1);
++    bounds.push_back(iterLen);
++    SmallVector<int64_t, 5> strides(starts.size() - 1, 1);
++    strides.push_back(chunkSize);
++
++    SmallVector<SmallVector<Value, 5>, 9> startStorage;
++    startStorage.reserve(chunkSize + 1);
++    startStorage.push_back(starts);
++    for (int64_t lane = 0; lane < chunkSize; ++lane) {
++      SmallVector<Value, 5> laneStarts = starts;
++      laneStarts.back() = b.createOrFold<arith::ConstantIndexOp>(loc, lane);
++      startStorage.push_back(std::move(laneStarts));
++    }
++    SmallVector<ValueRange, 9> domainStarts;
++    SmallVector<Attribute, 9> domainTransforms;
++    domainStarts.reserve(startStorage.size());
++    domainTransforms.reserve(startStorage.size());
++    for (auto &domainStart : startStorage)
++      domainStarts.push_back(domainStart);
++    domainTransforms.push_back(b.getArrayAttr({}));
++    for (int64_t lane = 0; lane < chunkSize; ++lane)
++      domainTransforms.push_back(transforms);
++
++    auto outputLoop = TransformingForOp::create(
++        b, loc, domainStarts, domainTransforms, bounds, strides,
++        sinkForceUnroll, writer.getUseIndexDiffs(), ValueRange{});
++    {
++      OpBuilder::InsertionGuard guard(b);
++      b.setInsertionPointToStart(outputLoop.getBody());
++      Value chunkBase = outputLoop.getLowerCoords(/*domain=*/0)[extraIdxCount];
++      for (int64_t lane = 0; lane < chunkSize; ++lane) {
++        Value iter = chunkBase;
++        if (lane != 0) {
++          Value laneValue = b.createOrFold<arith::ConstantIndexOp>(loc, lane);
++          iter = b.createOrFold<arith::AddIOp>(loc, chunkBase, laneValue);
++        }
++        IRMapping mapper;
++        for (auto [index, input] : llvm::enumerate(generic.getInputs())) {
++          BlockArgument argument = body.getArgument(index);
++          Value loaded = InBoundsLoadOp::create(b, loc, argument.getType(),
++                                                input, ValueRange{iter});
++          mapper.map(argument, loaded);
++        }
++        for (Operation &bodyOp : body.without_terminator())
++          b.clone(bodyOp, mapper);
++        Value result = mapper.lookupOrDefault(yield.getValues().front());
++        InBoundsStoreOp::create(b, loc, result, reuseTile, ValueRange{iter});
++        GlobalStoreOp::create(b, loc, reuseTile, destBuffer, b.getIndexAttr(1),
++                              writer.getStoreMethodAttr(), iter,
++                              outputLoop.getValidity(/*domain=*/lane + 1),
++                              outputLoop.getLowerCoords(/*domain=*/lane + 1),
++                              needs64BitIdx ? b.getUnitAttr() : nullptr,
++                              /*canStoreOffEnd=*/nullptr,
++                              /*nontemporal=*/b.getBoolAttr(false));
++      }
++    }
++
++    b.eraseOp(writer);
++    b.eraseOp(generic);
++    if (resultAlloc.getOutput().use_empty())
++      b.eraseOp(resultAlloc);
++    llvm::errs() << "SAM3_SINK_APPLIED " << func.getName()
++                 << " chunk=" << chunkSize << " unroll=" << sinkForceUnroll
++                 << "\n";
++  }
++  return success();
++}
++
+ void RockLinalgAlignPass::runOnOperation() {
+   MLIRContext *ctx = &getContext();
+   func::FuncOp func = getOperation();
+@@ -1667,5 +1913,7 @@ void RockLinalgAlignPass::runOnOperation() {
+                  MemcpyRewritePattern>(ctx);
+     if (failed(applyAlignPatterns(func, std::move(patterns))))
+       return signalPassFailure();
++    if (failed(sinkFinalErfGeneric(func)))
++      return signalPassFailure();
+   }
+ }

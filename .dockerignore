@@ -4,7 +4,11 @@
 # Allow files and directories
 !*.txt
 !*.ini
+!LICENSE
 !/tools/*.txt
 !/tools/*.sh
+!/tools/sam3_fc1sink/
+!/tools/sam3_fc1sink/align_sink_final.patch
+!/tools/sam3_fc1sink/check_rocmlir_patch.sh
 !/test/onnx/.onnxrt-commit
 !/docs/sphinx/*.txt
